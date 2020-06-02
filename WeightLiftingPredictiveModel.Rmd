@@ -1,0 +1,197 @@
+---
+title: "Predictive Modelling for Weight Lifting Form"
+author: "Aaron Mah"
+date: "6/1/2020"
+output: html_document
+---
+
+```{r setup, include="FALSE"}
+knitr::opts_chunk$set(echo = TRUE, fig.width=12, fig.height=8, fig.path='Figs/',
+                       warning=FALSE, message=FALSE, eval=FALSE)
+```
+
+## Executive Summary
+
+The purpose of this analysis is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways*. Using this data, we attempt to build a classification model that will accurately predict how well a user has performed an exercise. The overall methodology included cleaning the data, initial exploratory analysis, preprocessing the data, testing different models and arriving at a blended model that reached a 98.14% accuracy rate on test data.
+
+*All data is collected from https://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har
+
+## Loading data
+
+We load the relevant dataset, as well as split our training data into a training and validation set. Testing our models against this validation set will decrease the bias in our data. We will evaluate against the test data exactly once.
+```{r results="hide"}
+library(caret)
+library(ggplot2)
+trainURL <- 'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv'
+download.file(trainURL, destfile="./trainURL.csv")
+train <- read.csv('./trainURL.csv')
+
+testURL <- 'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv'
+download.file(testURL, destfile="./testURL.csv")
+testing <- read.csv('./testURL.csv')
+
+inTrain <- createDataPartition(train$classe, p=0.75, list=FALSE)
+training <- train[inTrain,]
+validation <- train[-inTrain,]
+dim(training); dim(validation); dim(testing)
+
+
+```
+
+#X Exploratory Analysis
+
+With a large number of predictors (160), this data will require compression. This will take the form of evaluating zero variance predictors as well as primary components. It's also apparent that there are some consistent patterns around NA values (either zero NA values of nearly the exact same number, at 13449). The large number of NA values will need to be dealt with before model-building. An additional 'X' column will also need to be stripped out, as to not become and unintentional predictor (vs. simply a row identifier).
+
+```{r results="hide"}
+library(GGally)
+library(ggplot2)
+library(RANN)
+library(dplyr)
+head(training)
+summary(training)
+dim(training); dim(validation); dim(testing)
+str(training)
+
+```
+
+## Cleaning up data
+
+Columns are appropriately converted to factors/numeric. NZV is used to identify and filter variables that are zero variance. NA values are replaced with zero, with NA's being interpreted as 0, ie. sensor is in resting state. For example, 0 roll or 0 pitch is representative of zero movement in these two axis (instead of NA). 
+
+```{r results="hide"}
+numeric <- names(training)[!names(training) %in% c("X","user_name", "cvtd_timestamp", "new_window","classe")]
+training[,numeric] <- lapply(training[,numeric], function(x) as.numeric(as.character(x)))
+validation[,numeric] <- lapply(validation[,numeric], function(x) as.numeric(as.character(x)))
+
+numeric <- names(testing)[!names(testing) %in% c("X","user_name", "cvtd_timestamp", "new_window","problem_id")]
+testing[,numeric] <- lapply(testing[,numeric], function(x) as.numeric(as.character(x)))
+
+
+colfactor <- names(training)[names(training) %in% c("user_name", "new_window", "classe")]
+training[,colfactor] <- lapply(training[,colfactor], as.factor)
+validation[,colfactor] <- lapply(validation[,colfactor], as.factor)
+
+colfactortest <- names(testing)[names(testing) %in% c("user_name", "new_window")]
+testing[,colfactortest] <- lapply(testing[,colfactortest], as.factor)
+
+
+#high dimensionality, check for zero variance; a lot of columns flagged for nzv
+nzv <- nearZeroVar(training,saveMetrics = TRUE)
+nzv
+
+#remove zero variance columns
+training <- training[nzv$zeroVar==FALSE]
+validation <- validation[,names(training)]
+testing <- testing[!nzv$zeroVar==TRUE]
+
+# Given that there's exactly the same number of NA values across these columns, I'm interpreting the NA's
+# as 0, ie. sensor is in resting state. for example, 0 roll or 0 pitch when there are no values (instead of NA)
+
+training[is.na(training)] <- 0
+validation[is.na(validation)] <- 0
+testing[is.na(testing)] <- 0
+
+```
+
+
+## Data Compression
+
+PCA is used to reduce dimensionality, reducing 160 predictors to 64 with a threshold of 0.95(variance retained).
+
+```{r}
+#attempt pca, but it complains about near zero variance columns to reduce dimensionality
+preProc <- preProcess(training[,c(-1,-151)], method="pca", threshold=0.95)
+trainingPCA <- predict(preProc, training)
+
+validationPCA <- predict(preProc,validation) 
+testingPCA <- predict(preProc,testing)
+
+summary(trainingPCA)
+dim(trainingPCA) # reduced to 64 predictors
+str(testingPCA)
+
+```
+
+## Model Selection
+
+To tackle this classification problem, classically high-performing models were evaluated first. Random forest was the best performing individually, at 98.14%. Gradient boosting, linear discriminant analysis and SVM were also tried (although SVM was later stripped out due to the nature of the test data/evaluation set).
+
+```{r results="hide"}
+# We'll also attempt some simple blending to evaluate effectiveness
+library(parallel)
+library(doParallel)
+
+## Random Forest model, at 97.9% 
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+fitControl <- trainControl(method="cv", number=5, allowParallel = TRUE)
+modelrf <- train(classe~., data=trainingPCA, method='rf', trControl=fitControl)
+modelrf$finalModel
+modelrf
+stopCluster(cluster)
+registerDoSEQ()
+
+# Testing against validation data set to test out of sample error
+predict(modelrf, validationPCA)
+validationPCA$classe <- as.factor(validationPCA$classe)
+trainingPCA$classe <- as.factor(trainingPCA$classe)
+confusionMatrix(validationPCA$classe, predict(modelrf, validationPCA)) # 98.33%, one percent short with only rf
+
+
+# Boost model against training data
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+fitControl <- trainControl(method="cv", number=5, allowParallel = TRUE)
+modelbst <- train(classe~., data=trainingPCA, method='gbm', trControl=fitControl) # 95%
+
+modelbst
+stopCluster(cluster)
+registerDoSEQ()
+
+# testing against validation set
+confusionMatrix(validationPCA$classe, predict(modelbst,validationPCA)) # 95% against validation set
+
+confusionMatrix(predict(modelrf, validationPCA), predict(modelbst,validationPCA))  # 95% accuracy between the two models
+models <- list(modelbst,modelrf)
+modelCor(models)
+
+# LDA
+modelLDA <- train(classe~., data=trainingPCA, method="lda")
+modelLDA #97%
+
+confusionMatrix(validationPCA$classe, predict(modelLDA, validationPCA)) #97.69
+
+# Three models, with rf at 98%. Will attempt to blend
+
+#blending the models
+rf <-predict(modelrf, trainingPCA)
+bst <- predict(modelbst,trainingPCA)
+lda <- predict(modelLDA, trainingPCA)
+
+blendDF <- data.frame(randomf=rf, boost=bst, linearda=lda, outcomeclass=trainingPCA$classe)
+
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+fitControl <- trainControl(method="cv", number=5, allowParallel = TRUE)
+modelblend <- train(outcomeclass~., data=blendDF, method='rf')
+stopCluster(cluster)
+registerDoSEQ()
+
+modelblend$finalModel # looks promissing at 0% OOB error rate
+modelblend
+blendpredict <- predict(modelblend,validationPCA)
+
+# Testing against validation
+validrf <- predict(modelrf, validationPCA)
+validbst <- predict(modelbst, validationPCA)
+validlda <- predict(modelLDA, validationPCA)
+
+validBlend <- data.frame(randomf=validrf, boost=validbst, linearda=validlda, outcomeclass=validationPCA$classe)
+confusionMatrix(validBlend$outcomeclass, predict(modelblend, validBlend)) # 98.56, which is a 0.1% gain..on validation
+
+```
+
+## Conclusion
+
+After trying the three models, we blended the three models (using random forest as the top level model) with a 0% gain on the validation set, but an out-of-box error rate at 0%. Although the accuracy didn't improve, the OOB error rate was substantial enough to warrant using the blended model instead of purely random forest. Evaluating on the test set, the final model performed at 95% accuracy.
